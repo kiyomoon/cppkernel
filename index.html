@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Running C++ Exceptions and RTTI in a Bare-Metal aarch64 Kernel</title>
+<meta name="description" content="An investigation into making stock GCC libsupc++ and libgcc_eh run exceptions and RTTI inside a freestanding aarch64 kernel.">
+<style>
+  :root {
+    --text: #1a1a1a;
+    --text-secondary: #555;
+    --bg: #fff;
+    --border: #e0e0e0;
+    --code-bg: #f5f5f5;
+    --accent: #2563eb;
+    --table-stripe: #fafafa;
+    --quote: #666;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --text: #e0e0e0;
+      --text-secondary: #999;
+      --bg: #1a1a1a;
+      --border: #333;
+      --code-bg: #252525;
+      --accent: #60a5fa;
+      --table-stripe: #222;
+      --quote: #b0b0b0;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.75;
+    font-size: 18px;
+  }
+  .container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 60px 24px 120px;
+  }
+  h1 {
+    font-size: 2em;
+    line-height: 1.25;
+    margin-bottom: 0.4em;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    color: var(--text-secondary);
+    font-size: 0.95em;
+    margin-bottom: 2.5em;
+    font-style: italic;
+  }
+  h2 {
+    font-size: 1.3em;
+    margin-top: 2.5em;
+    margin-bottom: 0.6em;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-size: 1.05em;
+    margin-top: 1.8em;
+    margin-bottom: 0.6em;
+    font-weight: 700;
+  }
+  p { margin-bottom: 1.2em; }
+  strong { font-weight: 700; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5em 0;
+  }
+  code {
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+    font-size: 0.85em;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin-bottom: 1.5em;
+    font-size: 0.82em;
+    line-height: 1.6;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 1.5em;
+    font-size: 0.9em;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    font-weight: 700;
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-secondary);
+  }
+  tbody tr:nth-child(even) td { background: var(--table-stripe); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul, ol {
+    margin: 0 0 1.5em 1.4em;
+  }
+  li {
+    margin-bottom: 0.5em;
+  }
+  blockquote {
+    margin: 0 0 1.5em;
+    padding: 0 0 0 16px;
+    border-left: 3px solid var(--border);
+    color: var(--quote);
+  }
+  .footer {
+    margin-top: 4em;
+    padding-top: 2em;
+    border-top: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.85em;
+  }
+  @media (max-width: 600px) {
+    body { font-size: 16px; }
+    .container { padding: 32px 16px 80px; }
+    h1 { font-size: 1.6em; }
+    table { font-size: 0.8em; }
+    th, td { padding: 6px 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1
+id="running-c-exceptions-and-rtti-in-a-bare-metal-aarch64-kernel">Running
+C++ Exceptions and RTTI in a Bare-Metal aarch64 Kernel</h1>
+<div class="subtitle">A research note on stock GCC exceptions and RTTI in a freestanding aarch64 kernel; April 2026</div>
+<p>I wanted to know whether C++ exceptions could actually work in a
+kernel.</p>
+<p>Every freestanding C++ guide, embedded C++ tutorial, and kernel
+coding standard I've ever read leads with two flags:
+<code>-fno-exceptions</code> and <code>-fno-rtti</code>. They always
+travel together. The stated reasons cluster into "exceptions are slow,"
+"exceptions are non-deterministic," and "exceptions need too much
+runtime support for a freestanding environment" — and by association,
+the same arguments get applied to RTTI, even though RTTI on its own
+doesn't do stack unwinding. Neither flag survives contact with real
+systems code. Both get turned off, as a pair, everywhere.</p>
+<p>I wasn't interested in the cost arguments in this experiment. The
+interesting question was the third one: do the runtimes for these
+features actually need so much environment support that a freestanding
+kernel can't host them? Or, more simply: on modern GCC, on modern
+aarch64, what happens if you just... don't disable them?</p>
+<p>So I built a toy kernel and tried. The short version: both work.
+Exceptions took seven subtle walls to get past, most of which turned out
+to have nothing to do with exceptions themselves — they were CPU
+bring-up issues that any aarch64 kernel has to solve anyway. Once
+exceptions were running, RTTI was a single commit: one flag removed, one
+test added, zero new runtime machinery required. That was the more
+interesting finding for me: <strong>in this setup, the two flags that
+embedded guides usually disable together turned out to be much closer to
+one decision than two separate ones.</strong> C++ exception type
+matching already requires the RTTI machinery (<code>type_info</code>,
+class hierarchy descriptors, <code>__dynamic_cast</code>) to be linked
+and working. Once that machinery is present, <code>typeid</code> and
+<code>dynamic_cast</code> on ordinary polymorphic types come along
+almost for free.</p>
+<p>This article records the seven walls because they were not obvious to
+me at the start, and because each one is manageable once you know where
+it lives. The RTTI postscript at the end of the article explains why it
+came for free here, and why the conventional pairing of
+<code>-fno-exceptions -fno-rtti</code> deserves a more careful
+explanation on modern toolchains than it usually gets.</p>
+<hr />
+<h2 id="the-experiment">The Experiment</h2>
+<p><code>cppkernel</code> is a toy aarch64 kernel I built in about two
+days as part of a larger "C++ in kernel space" investigation. It runs on
+the QEMU virt machine with <code>-cpu cortex-a72 -m 128M</code>, is
+compiled with GCC 14 or later in <code>-std=c++17</code> mode (the code
+uses nothing newer), and links statically against
+<code>libsupc++.a</code> and <code>libgcc_eh.a</code> exactly as they
+ship in the GCC install. Those two libraries are used unmodified — no
+patches, no forks, no rebuild. The investigation was done on GCC 16
+trunk because the surrounding project is exploring C++26 reflection for
+a later milestone, but stock Ubuntu <code>g++-14</code> is sufficient
+for everything in this article. The work that went into making the
+kernel <em>able to use</em> the runtime is a different story, and it's
+what the rest of this article is about.</p>
+<p>The kernel has six source files:</p>
+<ul>
+<li><code>boot.S</code> — aarch64 entry point (EL1 dispatch, FPU enable,
+MMU bring-up, BSS zero, <code>.init_array</code>, jump to C++)</li>
+<li><code>kernel.cpp</code> — the test driver</li>
+<li><code>cxxrt.cpp</code> — the libc stub surface and one override</li>
+<li><code>heap.hpp</code> — a 512KB bump allocator</li>
+<li><code>uart.hpp</code> — PL011 driver at <code>0x09000000</code></li>
+<li><code>linker.ld</code> — standard section layout</li>
+</ul>
+<p>The tests the kernel has to pass are these:</p>
+<pre class="cpp"><code>// --- M3: exceptions ---
+
+struct KernelError {
+    int errno_val;
+    const char* msg;
+};
+
+[[gnu::noinline]] static void inner_function() {
+    uart::puts(&quot;  entering inner_function\n&quot;);
+    throw KernelError{-22, &quot;EINVAL from inner&quot;};
+}
+
+[[gnu::noinline]] static void outer_function() {
+    uart::puts(&quot;  entering outer_function\n&quot;);
+    inner_function();
+}
+
+static void test_exceptions() {
+    // Same-frame throw/catch
+    try {
+        throw KernelError{-1, &quot;direct throw&quot;};
+    } catch (const KernelError&amp; e) {
+        print_errno(e);
+    }
+
+    // Throw across two real stack frames
+    try {
+        outer_function();
+    } catch (const KernelError&amp; e) {
+        print_errno_and_msg(e);
+    }
+}
+
+// --- M4: RTTI, reusing an M2 polymorphic hierarchy ---
+
+struct FileSystem { virtual ~FileSystem() = default;
+                    virtual const char* type_name() = 0; };
+struct RamFS  : FileSystem { const char* type_name() override { return &quot;ramfs&quot;;  } };
+struct ProcFS : FileSystem { const char* type_name() override { return &quot;procfs&quot;; } };
+
+static void test_rtti() {
+    FileSystem* fs1 = new RamFS();
+    FileSystem* fs2 = new ProcFS();
+
+    // typeid on polymorphic reference — must reflect the runtime type.
+    check(typeid(*fs1).name() == mangled(&quot;RamFS&quot;));
+    check(typeid(*fs2).name() == mangled(&quot;ProcFS&quot;));
+
+    // Downcasts: success when the dynamic type matches, nullptr otherwise.
+    check(dynamic_cast&lt;RamFS*&gt;(fs1)  != nullptr);
+    check(dynamic_cast&lt;ProcFS*&gt;(fs1) == nullptr);
+    check(dynamic_cast&lt;ProcFS*&gt;(fs2) != nullptr);
+
+    check(typeid(*fs1) != typeid(*fs2));
+}</code></pre>
+<p>The exception tests need their two throws caught and their fields
+read. The RTTI tests need the runtime type information for
+<code>RamFS</code> and <code>ProcFS</code> to survive linking,
+<code>typeid</code> to return the correct mangled names
+(<code>5RamFS</code> / <code>6ProcFS</code> in Itanium mangling), and
+<code>dynamic_cast</code> to correctly succeed or return nullptr based
+on the actual dynamic type.</p>
+<p>That's the whole test surface. Two throws, two catches, stack
+unwinding across non-inlined frames, plus a handful of type-query
+operations. The reason this is interesting is that it's an end-to-end
+check of a very long chain: <code>throw</code> →
+<code>__cxa_allocate_exception</code> → <code>__cxa_throw</code> →
+<code>_Unwind_RaiseException</code> → two-phase Itanium ABI search →
+personality routine → <code>__cxa_begin_catch</code> → catch block →
+<code>__cxa_end_catch</code>, plus <code>typeid</code> →
+<code>std::type_info::name()</code> and <code>dynamic_cast</code> →
+<code>__dynamic_cast</code> → class hierarchy walk. Every link in those
+chains lives inside unmodified libsupc++ or libgcc_eh. All the kernel
+has to do is bring the CPU up into a state those libraries can assume —
+FP/SIMD enabled, MMU on with RAM mapped as Normal memory, a few heap and
+linker details — and otherwise stay out of the runtime's way. No
+scheduler, no interrupts, no filesystem, no userspace. Just enough CPU
+bring-up for the runtime to run.</p>
+<p>That turned out to be the hard part.</p>
+<h2 id="the-seven-walls">The Seven Walls</h2>
+<p>Each wall hid the next one. Every time I got past one, the next
+symptom looked like "same problem, but deeper," and I had to stare at
+disassembly for a while to realize it was actually something new. I'll
+describe them in the order I hit them, with the symptom first, because
+that's what future-me will see if I retry this on a different
+platform.</p>
+<h3 id="wall-1--the-stub-list-is-larger-than-the-tutorials-say">Wall 1 —
+The stub list is larger than the tutorials say</h3>
+<p>Every freestanding C++ tutorial tells you you need
+<code>operator new</code>, <code>operator delete</code>,
+<code>__cxa_atexit</code>, <code>__cxa_pure_virtual</code>, and
+<code>__dso_handle</code>. These are enough for constructors and virtual
+dispatch. They are not even close to enough for exceptions.</p>
+<p>The actual list of symbols libsupc++ and libgcc_eh want resolved at
+link time, for the test above, is about thirty functions. Grouped by
+category:</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Functions</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allocation</td>
+<td><code>malloc</code>, <code>free</code>, <code>calloc</code>,
+<code>realloc</code></td>
+</tr>
+<tr>
+<td>mem/str</td>
+<td><code>memcpy</code>, <code>memset</code>, <code>memmove</code>,
+<code>memcmp</code>, <code>strlen</code>, <code>strcmp</code>,
+<code>strchr</code>, <code>strncmp</code></td>
+</tr>
+<tr>
+<td>panic/io (unreached if terminate handler is overridden)</td>
+<td><code>abort</code>, <code>sprintf</code>, <code>fputs</code>,
+<code>fputc</code>, <code>fwrite</code>, <code>stderr</code></td>
+</tr>
+<tr>
+<td>env probes</td>
+<td><code>secure_getenv</code>, <code>getenv</code>,
+<code>__isoc23_strtoul</code>, <code>__getauxval</code>,
+<code>getauxval</code></td>
+</tr>
+<tr>
+<td>pthread (no-op, single-threaded)</td>
+<td><code>pthread_mutex_*</code>, <code>pthread_key_*</code>,
+<code>pthread_cond_*</code>, <code>pthread_once</code>,
+<code>pthread_getspecific</code>, <code>pthread_setspecific</code></td>
+</tr>
+<tr>
+<td>loader</td>
+<td><code>_dl_find_object</code></td>
+</tr>
+</tbody>
+</table>
+<p>None of it is exotic. <code>malloc</code> forwards to the bump
+allocator. <code>free</code> is a no-op. The pthread functions are all
+no-ops because we're single-threaded. The env-reading functions return
+null, which causes libsupc++'s exception pool to use its compiled-in
+default size. <code>_dl_find_object</code> returns failure, which causes
+libgcc's unwinder to fall back to the static
+<code>__register_frame</code> registry instead of the glibc
+dynamic-loader path.</p>
+<p>The interesting one is <code>strcmp</code>. Even compiled with
+<code>-fno-rtti</code>, C++ exception type matching still goes through
+<code>type_info::operator==</code>, which compares the mangled type
+names with <code>strcmp</code>. If you remove <code>strcmp</code> from
+the stub list, every <code>catch</code> block becomes a link-time error.
+<code>-fno-rtti</code> does not strip the type info for <em>thrown</em>
+types; it only strips <code>typeid</code> and <code>dynamic_cast</code>
+on non-thrown paths.</p>
+<p>Total: ~150 lines of stubs. Most of them one-liners.</p>
+<h3 id="wall-2--do-not---whole-archive-libgcc_eh">Wall 2 — Do not
+<code>--whole-archive</code> libgcc_eh</h3>
+<p>Older guides for linking libgcc_eh into freestanding binaries tell
+you:</p>
+<pre><code>-Wl,--whole-archive -lgcc_eh -Wl,--no-whole-archive</code></pre>
+<p>The reasoning was that parts of the unwinder's frame-lookup code used
+to be referenced only indirectly through <code>.eh_frame</code> data,
+and the linker's dead-code elimination would drop them if you didn't
+force-include.</p>
+<p>On modern GCC (14 and later), this is no longer true.
+<code>__cxa_throw</code> in libsupc++ has a direct symbol reference to
+<code>_Unwind_RaiseException</code>, which pulls the entire DWARF
+unwinder through normal archive resolution. Plain <code>-lgcc_eh</code>
+is sufficient.</p>
+<p><code>--whole-archive</code> is actively harmful in freestanding
+builds. It drags in objects that have no reason to exist in a kernel —
+<code>emutls.o</code> (for <code>__thread</code> TLS emulation),
+<code>heap-trampoline.o</code> (for nested functions),
+<code>__aarch64_have_sme.o</code> (Scalable Matrix Extension detection),
+<code>lse-init.o</code> (Large System Extensions atomic detection),
+<code>unwind-dw2-fde-dip.o</code> (dynamic loader FDE lookup). Each of
+those drags in more undefined symbols: <code>mmap</code>,
+<code>pthread_cond_*</code>, <code>_dl_find_object</code>,
+<code>__getauxval</code>. The chain is long, and none of it is
+load-bearing for actual exception handling.</p>
+<p>Drop <code>--whole-archive</code>. Link with plain
+<code>-lsupc++ -lgcc_eh -lgcc</code>. This is the first piece of
+freestanding-C++ lore that turned out to be wrong on modern GCC.</p>
+<h3 id="wall-3--libsupc-runs-a-static-constructor-before-your-main">Wall
+3 — libsupc++ runs a static constructor before your
+<code>main</code></h3>
+<p><code>libsupc++.a(eh_alloc.o)</code> contains a file-scope static:
+the exception memory pool. Its constructor runs from
+<code>.init_array</code>, which every freestanding kernel traverses
+before entering <code>main</code>. The constructor reads
+<code>GLIBCXX_EXCEPTION_POOL_SIZE</code> (null → default size), calls
+<code>malloc(pool_size)</code>, and
+<code>memset(pool, 0, pool_size)</code>.</p>
+<p>My original design had <code>heap::init()</code> called from inside
+<code>kernel_main</code>. That put heap setup too late: the libsupc++
+constructor wanted to <code>malloc</code> during
+<code>.init_array</code>, the bump pointer was still zero, and the
+subsequent <code>memset</code> wrote to low memory addresses and hung
+the kernel.</p>
+<p>The fix is one line: <code>heap::alloc</code> does its own lazy init,
+<code>if (!next) next = __heap_start;</code>. Calling
+<code>heap::init()</code> later from <code>kernel_main</code> is then
+redundant, and if you're not careful it <em>resets</em> the bump
+pointer, overwriting the exception pool that libsupc++ already
+allocated. The safe version is idempotent — only initialize if not
+initialized yet.</p>
+<p>Generalization: in freestanding C++ you cannot assume your
+main-equivalent runs before any allocation. Static constructors from
+linked archives reach for <code>malloc</code> during
+<code>.init_array</code>. Plan your heap ordering accordingly.</p>
+<h3 id="wall-4--eh_frame-needs-a-zero-sentinel">Wall 4 —
+<code>.eh_frame</code> needs a zero sentinel</h3>
+<p><code>__register_frame(begin)</code> in libgcc walks contiguous FDE
+(Frame Descriptor Entry) records, advancing by each record's length
+field, until it hits a CIE with length zero. That zero terminator is
+normally contributed by <code>crtend.o</code>'s tiny
+<code>.eh_frame</code> fragment in hosted builds. Freestanding doesn't
+link crtend.</p>
+<p>Without the sentinel, <code>__register_frame</code> walks off the end
+of <code>.eh_frame</code> into whatever happens to follow it in memory,
+interprets garbage bytes as FDE lengths, and either loops forever or
+faults.</p>
+<p>Fix: add <code>QUAD(0)</code> at the end of the
+<code>.eh_frame</code> output section in <code>linker.ld</code>.</p>
+<pre><code>.eh_frame : {
+    __eh_frame_start = .;
+    KEEP(*(.eh_frame))
+    QUAD(0)
+    __eh_frame_end = .;
+}</code></pre>
+<p>Two words. Probably the cleanest fix in the whole investigation, and
+— having checked a few freestanding C++ tutorials — not something any of
+them mention.</p>
+<h3 id="wall-5--__cxa_get_globals-uses-thread-local-storage">Wall 5 —
+<code>__cxa_get_globals</code> uses thread-local storage</h3>
+<p>This one took longer to figure out than all the others combined,
+because the symptom was so far from the cause.</p>
+<p>When libstdc++-v3 is built with <code>_GLIBCXX_HAVE_TLS</code> set
+(the default on aarch64 glibc targets), its implementation of the
+per-thread exception state holder is:</p>
+<pre class="cpp"><code>static __thread __cxa_eh_globals global;
+__cxa_eh_globals* __cxa_get_globals() { return &amp;global; }</code></pre>
+<p>On aarch64, <code>__thread</code> compiles to a load from
+<code>TPIDR_EL0</code> plus a static offset. <code>TPIDR_EL0</code> is
+the user-mode thread pointer register. On Linux it's programmed by the
+kernel before each thread resumes. Our kernel never programs it — it
+reads zero or garbage. The subsequent dereference faults.</p>
+<p>If you haven't installed an exception vector table yet (which we
+hadn't), the fault silently hangs the CPU. The symptom is:
+<code>__cxa_throw</code> enters, makes one call, and nothing prints
+after that.</p>
+<p>The fix is to define <code>__cxa_get_globals</code> and
+<code>__cxa_get_globals_fast</code> in the kernel's own runtime TU:</p>
+<pre class="cpp"><code>static struct { void* caughtExceptions;
+                unsigned int uncaughtExceptions; } kernel_eh_globals;
+
+extern &quot;C&quot; void* __cxa_get_globals()      noexcept { return &amp;kernel_eh_globals; }
+extern &quot;C&quot; void* __cxa_get_globals_fast() noexcept { return &amp;kernel_eh_globals; }</code></pre>
+<p>The interesting part is <em>how</em> this override works. The linker
+processes <code>.o</code> files left-to-right and only pulls objects
+from <code>.a</code> archives to satisfy <em>unresolved</em> references.
+If our <code>cxxrt.o</code> defines <code>__cxa_get_globals</code>
+before <code>libsupc++.a</code> is processed, then when the linker sees
+libsupc++'s <code>eh_throw.o</code> (which references
+<code>__cxa_get_globals</code>), the reference is already satisfied, and
+<code>eh_globals.o</code> never gets pulled from the archive at all. The
+entire TLS dependency chain disappears.</p>
+<p>No <code>--wrap</code>. No patching of libsupc++. No rebuilding
+anything. Just "define the symbol earlier on the link line and the
+archive member goes dark." I found this override pattern underused in
+general; it's a clean way to replace a specific TU from a static
+archive.</p>
+<p>Single-threaded kernel, so one static global is fine. The struct
+layout has to match libsupc++'s <code>__cxa_eh_globals</code> — one
+<code>void*</code>, one <code>unsigned int</code>, no
+<code>propagatingExceptions</code> because we're not
+<code>__ARM_EABI_UNWINDER__</code>.</p>
+<h3
+id="wall-6--fpsimd-traps-by-default-and-gcc-inlines-memset-as-neon">Wall
+6 — FP/SIMD traps by default, and GCC inlines memset as NEON</h3>
+<p>This is the wall that cost me the most debugging time, because its
+symptom looked identical to Wall 5 at first glance: the kernel hung
+somewhere between <code>throw</code> and the <code>catch</code> block,
+with no output.</p>
+<p>The clue was in the disassembly of
+<code>__cxa_allocate_exception</code>. It looks like this on
+aarch64:</p>
+<pre class="asm"><code>400832d4: bl  malloc               // ret = malloc(header_size + n)
+400832d8: mov x1, x0
+400832dc: cbz x0, ...               // if null, pool fallback
+400832e0: movi v31.4s, #0x0         // NEON: v31 = 0
+400832e4: add x0, x1, #0x80         // return = ret + 128
+400832e8: stp q31, q31, [x1]        // NEON: store 32 bytes
+400832ec: stp q31, q31, [x1, #32]   //   32 more
+400832f0: stp q31, q31, [x1, #64]   //   32 more
+400832f4: stp q31, q31, [x1, #96]   //   32 more = 128 total
+400832f8: ...                       // return</code></pre>
+<p>The <code>memset(header, 0, 128)</code> inside
+<code>__cxa_allocate_exception</code> got inlined as four NEON 128-bit
+pair stores. <code>stp q31, q31, [addr]</code> writes 32 bytes per
+instruction from the NEON register bank.</p>
+<p>On aarch64, <code>CPACR_EL1.FPEN</code> is <code>0b00</code> on
+reset. Any FP or SIMD instruction at EL1 or EL0 traps to EL1. Without a
+vector table installed (<code>VBAR_EL1 = 0</code> or garbage), the trap
+has nowhere to go, and the CPU loops indefinitely.</p>
+<p>The reason M0, M1, and M2 ran fine without hitting this was pure
+coincidence: none of their generated code happened to use NEON. GCC
+picks NEON memset when the buffer is large enough and aligned enough;
+M0/M1/M2 never produced such a pattern. The first NEON instruction in
+the actual execution path of the kernel was inlined into
+<code>__cxa_allocate_exception</code>. The first <code>throw</code>
+statement in the kernel was the first thing that hit it.</p>
+<p>Fix: in <code>boot.S</code>, before anything else runs (including
+<code>.init_array</code>), set <code>CPACR_EL1.FPEN = 0b11</code> and
+follow with <code>isb</code>:</p>
+<pre class="asm"><code>mrs x0, cpacr_el1
+orr x0, x0, #(3 &lt;&lt; 20)
+msr cpacr_el1, x0
+isb</code></pre>
+<p>Six instructions. The catch: this has to happen before
+<code>.init_array</code>, because libsupc++'s exception pool static
+constructor also does a memset.</p>
+<h3
+id="wall-7--mmu-off-means-device-memory-which-rejects-unaligned-simd">Wall
+7 — MMU off means "Device memory," which rejects unaligned SIMD</h3>
+<p>With Wall 6 fixed, <code>__cxa_allocate_exception</code> returned,
+<code>__cxa_throw</code> ran, <code>_Unwind_RaiseException</code> ran,
+and <code>uw_init_context_1</code> ran — but then execution stopped
+inside <code>uw_frame_state_for</code>, <em>before</em> its first call
+to <code>_Unwind_Find_FDE</code>.</p>
+<p>The clue this time was that <code>__cxa_allocate_exception</code>'s
+inlined NEON memset had worked. It wrote to an address returned by
+<code>malloc</code>, which our bump allocator aligns to 16 bytes, so the
+NEON pair stores hit a 16-aligned target.
+<code>uw_frame_state_for</code>'s inlined memset writes to a local
+<code>_Unwind_FrameState fs</code> placed on the stack. GCC put it at
+<code>sp + 0x48</code>. That's 8-byte aligned but <strong>not</strong>
+16-byte aligned.</p>
+<p>An 8-aligned NEON pair store is where ARMv8-A memory type rules
+matter:</p>
+<ul>
+<li>On <strong>Normal</strong> memory, unaligned loads and stores are
+allowed unless <code>SCTLR_EL1.A = 1</code>.</li>
+<li>On <strong>Device</strong> memory, unaligned SIMD pair stores are
+not allowed. They take an alignment fault.</li>
+</ul>
+<p>When the MMU is disabled, all data accesses are treated as
+Device-nGnRnE by default. The <code>stp q31, q31, [fs, #800]</code> from
+<code>uw_frame_state_for</code> hit Device memory at an 8-aligned
+address, faulted, and — still no vector table — hung.</p>
+<p>The fix is to bring up a minimum MMU configuration:</p>
+<ul>
+<li><strong>MAIR_EL1</strong>: two attributes, <code>0x00</code>
+(Device-nGnRnE) in slot 0, <code>0x44</code> (Normal Inner/Outer
+Non-Cacheable) in slot 1.</li>
+<li><strong>Page table</strong>: one L1 table with four 1GB block
+entries. Entry 0 maps <code>0–1GB</code> to Device memory (that's where
+the UART lives at <code>0x09000000</code>). Entries 1, 2, 3 map
+<code>1–4GB</code> to Normal NC (kernel RAM starts at
+<code>0x40000000</code>).</li>
+<li><strong>TCR_EL1</strong>: <code>T0SZ=32</code> (4GB virtual address
+space), <code>EPD1=1</code> (disable TTBR1 walks), non-cacheable page
+table walks.</li>
+<li><strong>SCTLR_EL1.M = 1</strong> (enable the MMU).</li>
+</ul>
+<p>Notably, I did <em>not</em> enable the data or instruction caches
+(<code>SCTLR_EL1.C</code> and <code>I</code>). Non-cacheable Normal
+memory is enough to make unaligned SIMD legal, and avoiding caches
+avoids a whole category of cache-coherence bring-up work. For a toy
+kernel, this is a fine tradeoff.</p>
+<p>One sub-gotcha: the page table lives in <code>.bss</code> for 4KB
+alignment and zero initialization. The BSS zeroing loop has to run
+<em>before</em> MMU setup, not after. In my first attempt I had the
+order backwards, and zeroing BSS after enabling the MMU wiped the
+translation table out from under the running CPU — the next instruction
+fetch missed the TLB, the walk read zeros, and the kernel hung the
+instant BSS was cleared. Moving the BSS clear ahead of the MMU block
+fixed it.</p>
+<h2 id="dependencies-between-walls">Dependencies Between Walls</h2>
+<p>Walls 5, 6, and 7 are worth naming together because they mask each
+other.</p>
+<p>When I was fighting Wall 5 (the TLS issue), I spent a while believing
+that <code>__register_frame</code> itself had a bug —
+<code>register_pc_range_for_object</code> →
+<code>classify_object_over_fdes</code> → hang. I even worked around it
+with <code>--wrap=__register_frame</code> to no-op. The workaround moved
+the hang into Wall 6. I fixed Wall 6 (FP/SIMD), and the hang moved into
+Wall 7. I fixed Wall 7 (MMU), and everything downstream of Wall 7 —
+including the <code>__register_frame</code> code path I had worked
+around earlier — ran cleanly on the first try.</p>
+<p><strong>Walls 5, 6, and 7 had almost nothing to do with
+<code>__register_frame</code></strong>. They had to do with NEON
+instructions in Device memory and unset TLS registers. I only
+<em>thought</em> <code>__register_frame</code> was the problem because
+the hang appeared inside its call tree, and without a vector table I
+couldn't tell the difference between "bug inside this function" and
+"fault on the next NEON instruction this function issues."</p>
+<p>The generalization:</p>
+<blockquote>
+<p>In a kernel without an exception vector table, every CPU fault looks
+identical — a silent hang. You cannot tell a NEON trap from an alignment
+fault from a page fault. The only debugging tool is "add UART prints
+between every two instructions and bisect."</p>
+</blockquote>
+<p>The next feature bring-up for this kernel will install a minimal
+synchronous-exception handler at <code>VBAR_EL1</code> <em>first</em>,
+before any other work, so that the next hang shows up as
+<code>fault at ELR=0x... ESR=0x...</code> instead of silence. Doing that
+from the beginning would have saved most of the time I spent on Walls 5,
+6, and 7.</p>
+<h2 id="what-it-looks-like-when-it-works">What It Looks Like When It
+Works</h2>
+<p>After all seven walls were fixed, the nested throw test produced this
+trace. I've annotated it because the <code>printf</code>-style trace I
+was using during debugging captures every stub call, which turns out to
+be a surprisingly beautiful view of the Itanium C++ ABI two-phase
+unwinder in action:</p>
+<pre><code>entering outer_function
+entering inner_function
+  malloc(0x90) → 0x400b3360                        exception header + KernelError
+  __cxa_throw(obj, tinfo, dtor)
+    __cxa_get_globals()                            → our single-global override
+    _Unwind_RaiseException()
+      uw_init_context_1()
+        memset(context, 0, 960)
+        _Unwind_Find_FDE(pc=inside libgcc)         find first frame&#39;s CFI
+      [phase 1: search for handler]
+        _Unwind_Find_FDE(0x40082f33)               __cxa_throw frame
+        _Unwind_Find_FDE(0x40084f0f)               ...
+        _Unwind_Find_FDE(0x40082e57)               ...
+        _Unwind_Find_FDE(0x40081273)               inner_function
+        _Unwind_Find_FDE(0x4008128b)               outer_function
+        _Unwind_Find_FDE(0x400810bb)               kernel_main (HANDLER FOUND)
+      [phase 2: unwind + install]
+        _Unwind_Find_FDE(0x40082f33)               (same sequence, executing
+        _Unwind_Find_FDE(0x40084f0f)                destructors and restoring
+        _Unwind_Find_FDE(0x40082e57)                callee-saved registers
+        _Unwind_Find_FDE(0x40081273)                along the way)
+        _Unwind_Find_FDE(0x4008128b)
+        _Unwind_Find_FDE(0x400810bb)
+      __cxa_begin_catch()
+        __cxa_get_globals()
+  caught nested: errno=0x16 msg=EINVAL from inner
+      __cxa_end_catch()</code></pre>
+<p>Two phases, 13 FDE lookups, eight real stack frames. Everything
+between "malloc" and "caught nested" runs inside unmodified libsupc++
+and libgcc_eh, talking only to my kernel's stubs.</p>
+<p>The boring part is the point: a freestanding kernel doing C++
+exception handling looks exactly like a hosted process doing C++
+exception handling. Same library code, same call sequence, same result.
+Nothing clever.</p>
+<h2 id="a-postscript-on-rtti">A Postscript on RTTI</h2>
+<p>After M3 passed I expected RTTI to be its own adventure.
+<code>-fno-rtti</code> is the companion of <code>-fno-exceptions</code>
+in every embedded C++ guide, and the usual rationale is a mirror of the
+exception rationale: the runtime needs <code>type_info</code>, class
+hierarchy descriptors, <code>__dynamic_cast</code>, maybe demangling
+infrastructure. All of that is supposed to bring its own set of
+link-time demands and runtime assumptions.</p>
+<p>The work it actually took to enable RTTI was this:</p>
+<ul>
+<li>Remove <code>-fno-rtti</code> from the Makefile.</li>
+<li>Add <code>#include &lt;typeinfo&gt;</code> to
+<code>kernel.cpp</code>.</li>
+<li>Add a test function using <code>typeid(*fs).name()</code> and
+<code>dynamic_cast&lt;RamFS*&gt;(fs)</code> on the same
+<code>FileSystem</code>/<code>RamFS</code>/<code>ProcFS</code> hierarchy
+that M2 had used to test vtables.</li>
+<li>Rebuild.</li>
+<li>Run.</li>
+</ul>
+<p>The test passed on the first try. Zero new walls. Zero new stubs.
+Zero changes to <code>boot.S</code>, the linker script, the heap, or the
+runtime glue. The link step produced no new undefined references. Every
+piece of libsupc++ machinery that RTTI needs —
+<code>__cxxabiv1::__class_type_info</code>,
+<code>__cxxabiv1::__si_class_type_info</code>,
+<code>__dynamic_cast</code>, <code>type_info::name()</code> — was
+already in the binary, pulled in as a dependency of the M3 exception
+work.</p>
+<p>The reason, once I sat with it for a minute, is structural. C++
+exception type matching is already RTTI: when a
+<code>catch(KernelError&amp;)</code> clause runs, the runtime has to ask
+"is the thrown object's dynamic type compatible with
+<code>KernelError</code>?" — and that question is answered by exactly
+the same <code>type_info::operator==</code> and class hierarchy walk
+that <code>dynamic_cast</code> uses. In GCC's implementation, they are
+the same code. libsupc++'s <code>__do_catch</code> member on
+<code>__class_type_info</code> shares the same machinery as
+<code>__do_dyncast</code>. The <code>strcmp</code> call on mangled type
+names in the catch path that I discovered during M3 debugging is <em>the
+same strcmp</em> that <code>dynamic_cast</code> uses. In this
+environment, once one of these two features is working, the other is
+nearly free because the runtime support is already there.</p>
+<p>This suggests the conventional pairing of
+<code>-fno-exceptions -fno-rtti</code> in embedded C++ guides is broader
+than this GCC/aarch64 setup justifies. You can still disable both for
+size or policy reasons. But if exceptions are already on, RTTI stops
+looking like a separate runtime project and starts looking more like a
+flag that stayed off out of habit: exceptions need RTTI, so
+<code>-fno-rtti -fexceptions</code> is either a compilation error or
+quietly depends on the same machinery it claims to avoid. (GCC documents
+this explicitly: "The mechanism used to implement exceptions requires
+the type information system to work, so disabling RTTI will break
+exception handling.")</p>
+<p>What <em>is</em> a historically-valid reason to disable both: the
+<code>__verbose_terminate_handler</code> path that the C++ runtime
+installs by default pulls in <code>cp-demangle.o</code>, which is a
+substantial chunk of code dedicated to turning mangled names into
+readable form for a programmer to see. That code is dead weight in a
+kernel. But as described in Wall 5's cleanup, installing your own
+terminate handler via <code>std::set_terminate</code> prevents
+<code>cp-demangle.o</code> from ever being pulled from libsupc++.a,
+because nothing else references it. The size cost of "RTTI enabled" in a
+kernel that installs its own terminate handler is small — typeinfo
+objects for the classes you actually use, plus a handful of
+<code>__class_type_info</code> vtables, plus the
+<code>__dynamic_cast</code> routine. A few KB at most.</p>
+<p>I don't want to over-claim — this is a toy kernel with three
+polymorphic classes, and a real kernel with hundreds of polymorphic
+types would have proportionally more typeinfo data. But the point
+stands: the marginal cost of turning RTTI on, <em>given that exceptions
+are already on</em>, is negligible. If your default policy is "disable
+both," then it's still worth noticing that the first decision (disable
+exceptions) makes the second decision (disable RTTI) much larger than it
+needs to be. Flipping the order of that reasoning — "if I'm turning
+exceptions on anyway, RTTI is already there" — changes the tradeoff
+considerably.</p>
+<h2 id="what-i-did-not-do">What I Did Not Do</h2>
+<p>This experiment established one fact and nothing else. A few things
+that are explicitly out of scope, because I want the claim to be
+narrow:</p>
+<p><strong>I didn't measure exception cost.</strong> The "exceptions are
+too slow for kernels" argument is real. Our test runs, so we now have a
+platform on which to measure throw latency in cycles, but I haven't done
+that yet. Adding timer reads around the throw/catch boundary is the next
+task and would put real numbers on that tradeoff.</p>
+<p><strong>I didn't measure binary size.</strong> The sizes of
+<code>.eh_frame</code>, <code>.eh_frame_hdr</code>,
+<code>.gcc_except_table</code>, and the libsupc++/libgcc_eh text pulled
+into the kernel are the other half of the cost argument. They're easy to
+get with <code>size</code> and <code>objdump</code>. I just haven't done
+it.</p>
+<p><strong>I didn't enable caches.</strong> The MMU I set up uses Normal
+Non-Cacheable memory. Enabling D-cache and I-cache is a straightforward
+next step, and a real kernel would do it, but it wasn't needed for this
+experiment.</p>
+<p><strong>I didn't install an exception vector table.</strong> I said
+above that I should have, and that debugging would have been much faster
+if I had. For the completed M3 result, I just didn't need one — the
+kernel no longer faults. But any future work here should install one
+first.</p>
+<p><strong>I didn't test throwing from an interrupt handler.</strong>
+Exceptions interacting with interrupt context is one of the real, narrow
+arguments against C++ exceptions in kernels. I didn't address it.</p>
+<p><strong>I didn't integrate into a real kernel.</strong> This is a toy
+kernel that does nothing except boot, print, allocate, and throw.
+Whether any of this holds up inside a real kernel subsystem — with
+preemption, with spinlocks, with RCU — is a separate and much harder
+question. The point of this experiment is narrower: it establishes that
+the <em>runtime machinery</em> can exist at all in kernel mode. Getting
+there was mostly about finding the bring-up conditions and meeting
+them.</p>
+<h2 id="what-the-experiment-did-establish">What the Experiment Did
+Establish</h2>
+<blockquote>
+<p>On aarch64, with GCC 14 or later, the unmodified libsupc++ +
+libgcc_eh runtime can be made to support <strong>both C++ exceptions and
+RTTI</strong> in a freestanding kernel — linked statically, under
+explicit CPU bring-up conditions, with about 250 lines of libc stubs and
+one symbol override. No runtime patches. No custom unwinder. No forked
+libgcc. Enabling RTTI on top of a working exception setup is free — it
+requires removing a single Makefile flag.</p>
+</blockquote>
+<p>That is the claim, narrowed. The phrase I want to avoid is "works out
+of the box" — it doesn't, and anyone who tries will quickly hit at least
+a few of the walls above. The right framing is: <strong>the runtime
+itself does not need to be modified</strong>; what needs attention is
+the environment <em>around</em> it. Specifically, these preconditions
+have to be met:</p>
+<ol type="1">
+<li><strong>FP/SIMD enabled</strong>
+(<code>CPACR_EL1.FPEN = 0b11</code>), before any code — including
+<code>.init_array</code> — that could trigger an inlined NEON
+memset.</li>
+<li><strong>MMU on, with a Normal memory attribute for kernel
+RAM.</strong> An identity-mapped L1 table is fine; caches are optional.
+This is the precondition that lets libgcc's inlined NEON stores to
+unaligned stack addresses succeed.</li>
+<li><strong>A heap early enough for <code>.init_array</code>.</strong>
+libsupc++'s <code>eh_alloc</code> static constructor calls
+<code>malloc</code> before your <code>kernel_main</code> runs.</li>
+<li><strong>A terminate handler installed via
+<code>std::set_terminate</code></strong> that does not reach into
+libsupc++'s demangling / stderr path.</li>
+<li><strong><code>__cxa_get_globals</code> overridden</strong> to return
+a single file-scope global (or proper TLS set up). The stock libsupc++
+implementation is <code>static __thread</code>, which requires
+<code>TPIDR_EL0</code>.</li>
+<li><strong><code>.eh_frame</code> terminated with a
+<code>QUAD(0)</code> sentinel</strong> in the linker script, and
+<strong><code>__register_frame(&amp;__eh_frame_start)</code> called
+once</strong> before any throw.</li>
+</ol>
+<p>Each of these is a two-to-ten-line change in boot or runtime code.
+None of them is architectural work, and none of them requires editing
+libsupc++ or libgcc_eh. The distinction matters: <strong>the hard cases
+are all on the kernel side</strong>, where they're your problem anyway
+if you're bringing up any aarch64 kernel. The runtime side is just
+accounting.</p>
+<p>What convinced me this framing is accurate: the things I expected to
+be hard — the DWARF unwinder, the FDE lookup, the personality routine,
+the Itanium two-phase search — worked on the first run once the CPU
+state matched their assumptions. I had to write no code to make any of
+that work. I just had to stop breaking it.</p>
+<p>What this experiment adds, for me, is one concrete modern data point.
+The bring-up conditions above are rarely written down in one place,
+which makes the runtime look more alien to kernel code than it really
+is. The closest active project in this space is Khalil Estell's <a
+href="https://github.com/libhal/libhal-exceptions">libhal-exceptions</a>
+for Cortex-M, which takes a different tradeoff — it replaces parts of
+the runtime to shrink binary size and to remove the terminate-handler
+demangling path. This article points at a different corner of the space:
+on a platform where binary size is not the main constraint, the
+replacement work may be unnecessary. The stock runtime runs if you meet
+its preconditions. Knowing what those preconditions are is most of the
+work.</p>
+<hr />
+<h2 id="methodology">Methodology</h2>
+<p>The kernel was built inside a Docker container running Ubuntu 24.04
+with <code>g++-14</code> installed from apt. Nothing about the approach
+requires a GCC trunk — the ATOMIC_FDE_FAST_PATH frame registration and
+the libsupc++ TLS-based <code>__cxa_get_globals</code> that drive Walls
+5 and 7 have been stable since GCC 14. Compile flags:</p>
+<pre><code>-std=c++17
+-ffreestanding -nostdlib
+-fasynchronous-unwind-tables
+-Wall -Wextra -O2 -mcpu=cortex-a72</code></pre>
+<p>Nothing past C++17 is used in the kernel itself. Link:</p>
+<pre><code>-nostdlib -T linker.ld
+-L&lt;path-to-libsupc++.a&gt;
+-L&lt;path-to-libgcc_eh.a&gt;
+kernel.o cxxrt.o boot.o
+-lsupc++ -lgcc_eh -lgcc</code></pre>
+<p>The link order matters: <code>cxxrt.o</code> contains the
+<code>__cxa_get_globals</code> override, and it has to appear on the
+link line <em>before</em> <code>-lsupc++</code> so that the symbol is
+resolved from our object before libsupc++'s <code>eh_globals.o</code>
+has a chance to be pulled from the archive. <code>--whole-archive</code>
+is not used, and should not be used — see Wall 2.</p>
+<p>Run under QEMU:</p>
+<pre><code>qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -kernel build/kernel.elf</code></pre>
+<p>Host: MacBook Air M4, 16 GB RAM, macOS 26.3.1 (Darwin 25.3.0).</p>
+<p>Debugging technique during the investigation: every stub in
+<code>cxxrt.cpp</code> printed a short tag on entry/exit
+(<code>&lt;m:size&gt;</code>, <code>&lt;ms:addr,size&gt;</code>,
+<code>&lt;ceg&gt;</code>, etc.), and functions called through
+<code>--wrap</code>-ed entry points printed their own
+(<code>[wrap_throw:entry]</code>, <code>[wrap_ure:entry]</code>,
+<code>[wrap_find_fde pc=...]</code>). This turned the UART output into a
+trace of the runtime's internal calls, which is what made the seven
+walls visible instead of one undifferentiated hang. The final kernel has
+all of this instrumentation removed — the article's trace excerpt is
+preserved from the debug runs.</p>
+<hr />
+<h2 id="whats-next">What's Next</h2>
+<p>The next milestones on cppkernel are:</p>
+<ul>
+<li><strong>M5 (static reflection):</strong> GCC with C++26's
+<code>^^T</code> reflection operator. This is the direction of the
+larger project; M0 through M4 are infrastructure for M5.</li>
+<li><strong>M6 (a tiny subsystem):</strong> Use all of M1–M5 to build
+one small realistic piece of kernel — maybe a typed intrusive list
+replacing the macro-based <code>list_head</code> pattern, with
+reflection-driven iteration.</li>
+</ul>
+<p>The immediate follow-up article I'd like to write is a cost
+measurement — actual cycle counts for <code>throw → catch</code> on the
+nested test, compared against an equivalent
+<code>std::expected&lt;T, E&gt;</code> implementation on the same paths.
+That would put numbers on the "cost" question, which this article
+deliberately stays out of.</p>
+<p>If this overlaps with work you're already doing and you'd like to
+compare notes, feel free to reach out: <a
+href="mailto:toneverdo@gmail.com">toneverdo@gmail.com</a>.</p>
+<p>The full source of the kernel — about 900 lines including boot,
+runtime glue, and tests — is in this repository alongside the
+article.</p>
+<hr />
+<h2 id="appendix-two-extra-walls-from-distro-built-libsupc">Appendix:
+Two Extra Walls from Distro-Built libsupc++</h2>
+<p>The seven walls above are all about CPU state and C++ runtime
+assumptions — they are the interesting story. But I want to record two
+additional walls that only show up when you link against a
+distribution-packaged libsupc++, because anyone reproducing this with
+<code>apt install g++-14</code> on Ubuntu will hit them and be confused
+for the same reason I was.</p>
+<p>Both walls have the same shape: Ubuntu (and similar distros) compile
+their bundled libsupc++ with
+<strong><code>-fstack-protector-strong</code></strong> and
+<strong><code>-D_FORTIFY_SOURCE=2</code></strong> enabled. These produce
+<code>libsupc++.a(cp-demangle.o)</code> with link-time references to
+symbols that are normally provided by glibc's runtime — symbols that do
+not exist in a freestanding link.</p>
+<p><strong>Wall 8: <code>__stack_chk_guard</code> and
+<code>__stack_chk_fail</code> undefined.</strong> Stack protector emits
+a check prologue on every non-trivial function: read the canary from
+<code>__stack_chk_guard</code>, save it on the stack, verify it on exit,
+and call <code>__stack_chk_fail</code> if it changed. Freestanding
+builds don't provide these.</p>
+<p><strong>Wall 9: <code>__sprintf_chk</code> and friends
+undefined.</strong> <code>-D_FORTIFY_SOURCE=2</code> activates glibc
+header macros that rewrite <code>sprintf(buf, ...)</code> into
+<code>__sprintf_chk(buf, flag, buflen, ...)</code> for bounds checking.
+Similarly for <code>snprintf</code>, <code>vsnprintf</code>, and the
+<code>mem*</code> family. Freestanding builds don't provide any of these
+either.</p>
+<p>The interesting thing about both walls is that
+<strong><code>cp-demangle.o</code> is never executed in the running
+kernel.</strong> It's pulled in by the
+<code>__verbose_terminate_handler</code> path, which we short-circuit
+with our own terminate handler via <code>std::set_terminate</code>. The
+code is dead. But the symbols are referenced at link time regardless —
+they have to resolve or <code>ld</code> refuses to produce an ELF. So
+the fix is purely cosmetic: provide stub definitions that would panic if
+called, with the knowledge that they are never called.</p>
+<p>All nine stubs together are under 30 lines of code. They go into the
+same <code>cxxrt.cpp</code> as the M3 libc stubs.</p>
+<p>If you build your own GCC from source with the defaults used by
+<code>./configure &amp;&amp; make</code> inside the GCC source tree, you
+will not hit Walls 8 or 9, because that build uses a simpler default set
+of flags for libstdc++-v3. If you use a distro-packaged GCC (which any
+normal reproduction would), you will hit both. It's not a fact about
+libsupc++ — it's a fact about how someone else compiled it.</p>
+<p>I mention this because it took me a few iterations to realize that
+the count of walls I hit depended on where my toolchain came from. On my
+internal dev environment (a Dockerfile that builds GCC 16 trunk from
+source), the count is seven. On the public Dockerfile (Ubuntu 24.04 +
+stock <code>g++-14</code>), the count is nine. The nine-wall version is
+the one you'll experience if you reproduce this. I kept the article
+structured around the seven conceptually interesting walls because walls
+8 and 9 are not about C++ or kernels — they're about someone's choice of
+compilation flags — but they're just as real to anyone running
+<code>make</code> on this repository.</p>
+
+
+<div class="footer">
+<p>Source article: <a href="article-exceptions-rtti-aarch64.md">Markdown</a> &middot; Contact: <a href="mailto:toneverdo@gmail.com">toneverdo@gmail.com</a></p>
+</div>
+
+</div>
+</body>
+</html>

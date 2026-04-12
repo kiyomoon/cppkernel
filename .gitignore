@@ -1,0 +1,12 @@
+# Build outputs
+*/src/build/
+*/src/*.o
+*/src/*.elf
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
