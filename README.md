@@ -32,11 +32,14 @@ lives in a sibling subdirectory of this README.
 
 | Directory | What it is |
 |---|---|
-| [`aarch64/`](aarch64/) | aarch64 kernel source, Dockerfile, per-arch README |
+| [`aarch64/`](aarch64/) | aarch64 kernel with stock `g++-14` (hosted libsupc++, ~300-line runtime) |
+| [`aarch64-freestanding/`](aarch64-freestanding/) | aarch64 kernel with freestanding-configured GCC (11-symbol, ~60-line runtime) |
 
-Each architecture directory contains its own `src/`, `Makefile`,
-`Dockerfile`, and instructions. Building and running one does not
-require the others.
+`aarch64/` is the simpler starting point — install `g++-14` from
+apt and build in 3 minutes. `aarch64-freestanding/` builds GCC
+from source with the optimal freestanding recipe (~10-15 min) and
+shows how small the runtime surface can be. Both produce the same
+kernel output; they differ only in how much glue you write.
 
 ## Scope
 

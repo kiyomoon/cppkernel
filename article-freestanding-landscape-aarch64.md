@@ -167,6 +167,6 @@ The 11-symbol surface was found by linking the kernel with an empty runtime file
 
 The TLS bug was diagnosed using a synchronous exception vector table (`VBAR_EL1`) that reports `ELR_EL1` (faulting PC), `ESR_EL1` (exception syndrome), and `FAR_EL1` (fault address) on any data abort. Installing this vector table early in the boot sequence is the single most impactful debugging technique for bare-metal aarch64 work.
 
-The full source, development log, GCC configure recipe, and Dockerfile are in the project repository.
+The kernel source (~60-line runtime + boot + tests), the Dockerfile with the full GCC freestanding configure recipe, and build instructions are in [`aarch64-freestanding/`](aarch64-freestanding/) in this repository.
 
 Questions or similar findings: toneverdo@gmail.com.
