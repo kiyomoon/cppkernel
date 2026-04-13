@@ -19,15 +19,14 @@ This repository is a worked example.
 
 ## Articles
 
-| Article | Architecture | Status |
+| Article | Topic | Architecture |
 |---|---|---|
-| [Running C++ Exceptions and RTTI in a Bare-Metal aarch64 Kernel](article-exceptions-rtti-aarch64.md) | aarch64 (QEMU virt, Cortex-A72) | Published |
-| *x86_64 version* | x86_64 | Not yet started |
-| *RISC-V version* | riscv64 | Not yet started |
+| [Running C++ Exceptions and RTTI in a Bare-Metal aarch64 Kernel](article-exceptions-rtti-aarch64.md) | The seven walls to getting exceptions working | aarch64 |
+| [The Real Cost of C++ Exceptions in a Freestanding Kernel](article-freestanding-landscape-aarch64.md) | GCC's freestanding configure, the 11-function surface, C++26 toolbox | aarch64 |
 
-Each article is self-contained. You do not need to read them in
-order, and you do not need the code to read them. The code for
-each architecture lives in a sibling subdirectory of this README.
+Each article is self-contained. The second builds on the first
+but can be read independently. The code for each architecture
+lives in a sibling subdirectory of this README.
 
 ## Code
 
