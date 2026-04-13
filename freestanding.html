@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Real Cost of C++ Exceptions in a Freestanding Kernel</title>
+<meta name="description" content="GCC's freestanding configure recipe reduces C++ exception runtime stubs from 30 to 11 functions. Plus: what C++26 standard library is available in a kernel.">
+<style>
+  :root {
+    --text: #1a1a1a;
+    --text-secondary: #555;
+    --bg: #fff;
+    --border: #e0e0e0;
+    --code-bg: #f5f5f5;
+    --accent: #2563eb;
+    --table-stripe: #fafafa;
+    --quote: #666;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --text: #e0e0e0;
+      --text-secondary: #999;
+      --bg: #1a1a1a;
+      --border: #333;
+      --code-bg: #252525;
+      --accent: #60a5fa;
+      --table-stripe: #222;
+      --quote: #b0b0b0;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.75;
+    font-size: 18px;
+  }
+  .container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 60px 24px 120px;
+  }
+  nav {
+    margin-bottom: 2.5em;
+    font-size: 0.85em;
+    color: var(--text-secondary);
+    font-family: -apple-system, 'Helvetica Neue', sans-serif;
+  }
+  nav a { color: var(--accent); text-decoration: none; }
+  nav a:hover { text-decoration: underline; }
+  nav .current { color: var(--text); font-weight: 600; }
+  h1 {
+    font-size: 2em;
+    line-height: 1.25;
+    margin-bottom: 0.4em;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    color: var(--text-secondary);
+    font-size: 0.95em;
+    margin-bottom: 2.5em;
+    font-style: italic;
+  }
+  h2 {
+    font-size: 1.3em;
+    margin-top: 2.5em;
+    margin-bottom: 0.6em;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-size: 1.05em;
+    margin-top: 1.8em;
+    margin-bottom: 0.6em;
+    font-weight: 700;
+  }
+  p { margin-bottom: 1.2em; }
+  strong { font-weight: 700; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5em 0;
+  }
+  code {
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+    font-size: 0.85em;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin-bottom: 1.5em;
+    font-size: 0.82em;
+    line-height: 1.6;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 1.5em;
+    font-size: 0.9em;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    font-weight: 700;
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-secondary);
+  }
+  tbody tr:nth-child(even) td { background: var(--table-stripe); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul, ol {
+    margin: 0 0 1.5em 1.4em;
+  }
+  li {
+    margin-bottom: 0.5em;
+  }
+  blockquote {
+    margin: 0 0 1.5em;
+    padding: 0 0 0 16px;
+    border-left: 3px solid var(--border);
+    color: var(--quote);
+  }
+  .footer {
+    margin-top: 4em;
+    padding-top: 2em;
+    border-top: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.85em;
+  }
+  @media (max-width: 600px) {
+    body { font-size: 16px; }
+    .container { padding: 32px 16px 80px; }
+    h1 { font-size: 1.6em; }
+    table { font-size: 0.8em; }
+    th, td { padding: 6px 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<nav>
+<a href="index.html">Exceptions &amp; RTTI</a> &middot;
+<span class="current">Freestanding Landscape</span>
+</nav>
+
+<h1>The Real Cost of C++ Exceptions in a Freestanding Kernel</h1>
+<div class="subtitle">11 functions and a configure flag; April 2026</div>
+
+<p>In <a href="index.html">a previous article</a>, I documented seven walls I hit while getting C++ exceptions and RTTI to work in a bare-metal aarch64 kernel, linking against GCC's stock libsupc++ and libgcc_eh. The runtime glue I had to write was about 300 lines — mostly stubs for functions like <code>pthread_mutex_lock</code>, <code>secure_getenv</code>, <code>fwrite</code>, and <code>__cxa_get_globals</code> that libsupc++ reached for but that don't exist in a kernel.</p>
+
+<p>After publishing, I read libsupc++'s source code more carefully. I found that most of those 300 lines were unnecessary. GCC already has a freestanding build mode for libsupc++ — a set of configure options that have existed for years, documented individually but never assembled into a recipe for kernel exception support. When you use them, the stub surface drops from ~30 functions to 11, and the runtime glue file drops from ~300 lines to ~60.</p>
+
+<p>This article is about what those configure options are, what they do, and what the resulting landscape looks like for a kernel developer who wants modern C++ — exceptions, RTTI, <code>std::atomic</code>, <code>std::expected</code> — in a freestanding environment on GCC 16.</p>
+
+<hr>
+
+<h2>The Configure Recipe</h2>
+
+<p>GCC's <code>configure</code> script for libstdc++-v3 accepts these options:</p>
+
+<pre><code>--disable-hosted-libstdcxx
+--disable-tls
+--enable-threads=single
+--enable-libstdcxx-static-eh-pool
+--with-libstdcxx-eh-pool-obj-count=0
+--disable-libstdcxx-verbose</code></pre>
+
+<p>Plus, to avoid build failures in unrelated libraries that share headers with libstdc++:</p>
+
+<pre><code>--disable-libitm --disable-libsanitizer --disable-libgomp
+--disable-libquadmath --disable-libssp --disable-libvtv
+--disable-libstdcxx-pch</code></pre>
+
+<p>Each option addresses a specific piece of the runtime that a kernel doesn't have:</p>
+
+<table>
+<thead><tr><th>Option</th><th>What it does</th><th>Wall removed</th></tr></thead>
+<tbody>
+<tr><td><code>--disable-hosted-libstdcxx</code></td><td>Sets <code>_GLIBCXX_HOSTED=0</code>. Guards out <code>secure_getenv</code>, <code>fwrite</code>/<code>fputs</code>/<code>stderr</code>, the verbose terminate handler, <code>cp-demangle.c</code>, and the mutex in eh_alloc.</td><td>Walls 1, 8, 9</td></tr>
+<tr><td><code>--disable-tls</code></td><td>Undefines <code>_GLIBCXX_HAVE_TLS</code>. Makes <code>eh_globals.cc</code> use a single <code>__constinit</code> global instead of <code>__thread</code> TLS.</td><td>Wall 5</td></tr>
+<tr><td><code>--enable-threads=single</code></td><td>Compiles libgcc without gthread support. The btree FDE registry's version-lock and the DWARF reg-size-table once-init no longer reference pthread.</td><td>Wall 1 (pthread)</td></tr>
+<tr><td><code>--enable-libstdcxx-static-eh-pool</code> + <code>--with-...-obj-count=0</code></td><td>Sets <code>USE_POOL=0</code> in <code>eh_alloc.cc</code>. The emergency exception pool — which normally runs a <code>.init_array</code> constructor that calls <code>malloc</code> before your kernel's heap is ready — is compiled out entirely.</td><td>Wall 3</td></tr>
+<tr><td><code>--disable-libstdcxx-verbose</code></td><td>Sets <code>_GLIBCXX_VERBOSE=0</code>. The default terminate handler becomes <code>std::abort</code> instead of <code>__verbose_terminate_handler</code>, which would pull in the C++ name demangler and <code>fwrite</code>.</td><td>Part of Wall 1</td></tr>
+</tbody>
+</table>
+
+<p>None of these options requires patching GCC source. They are all standard <code>configure</code> flags, each individually documented, each in the GCC source tree for years. What's new is using them together for kernel exception support — a combination that, as far as I can find, has not been documented or tested end-to-end before.</p>
+
+<h2>What's Left: The 11-Function Surface</h2>
+
+<p>After building GCC with these options, I linked my toy kernel against the resulting libsupc++ and libgcc_eh with an <strong>empty</strong> runtime file — no stubs at all — and let the linker report every missing symbol. The complete list:</p>
+
+<table>
+<thead><tr><th>Symbol</th><th>Who needs it</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>malloc</code></td><td>libsupc++</td><td><code>__cxa_allocate_exception</code> allocates exception objects</td></tr>
+<tr><td><code>free</code></td><td>libsupc++</td><td><code>__cxa_free_exception</code> releases them</td></tr>
+<tr><td><code>calloc</code></td><td>libsupc++</td><td>eh_alloc internal use</td></tr>
+<tr><td><code>abort</code></td><td>libsupc++</td><td><code>std::terminate</code> default handler</td></tr>
+<tr><td><code>memcpy</code></td><td>libgcc_eh</td><td>DWARF CFI interpreter copies register state during unwind</td></tr>
+<tr><td><code>memmove</code></td><td>libgcc_eh</td><td>Same</td></tr>
+<tr><td><code>memset</code></td><td>libgcc_eh</td><td>Initializes unwind context</td></tr>
+<tr><td><code>strcmp</code></td><td>libsupc++</td><td><code>type_info::operator==</code> compares mangled type names</td></tr>
+<tr><td><code>strlen</code></td><td>libgcc_eh</td><td>CIE augmentation string parsing</td></tr>
+<tr><td><code>__getauxval</code></td><td>libgcc</td><td>aarch64 LSE/SME CPU feature detection (return 0)</td></tr>
+<tr><td><code>_dl_find_object</code></td><td>libgcc_eh</td><td>Dynamic loader FDE lookup fallback (return -1)</td></tr>
+</tbody>
+</table>
+
+<p>That's it. 9 standard C functions that any kernel already provides, plus 2 platform-specific one-liners. No pthread. No TLS override. No stdio. No environment probes. No stack protector stubs. No <code>__cxa_get_globals</code> override.</p>
+
+<p>The resulting runtime file is about 60 lines of C++. The operator new/delete definitions and the <code>__cxa_atexit</code> / <code>__cxa_pure_virtual</code> stubs that any freestanding C++ program needs are another 15 lines on top. Everything together fits in a single screen.</p>
+
+<h2>Before and After</h2>
+
+<table>
+<thead><tr><th>Metric</th><th>Hosted libsupc++</th><th>Freestanding libsupc++</th></tr></thead>
+<tbody>
+<tr><td>Runtime glue file</td><td>~300 lines</td><td><strong>~60 lines</strong></td></tr>
+<tr><td>External stub symbols</td><td>~28</td><td><strong>11</strong></td></tr>
+<tr><td><code>__cxa_get_globals</code> override needed</td><td>yes (16 lines)</td><td><strong>no</strong></td></tr>
+<tr><td>pthread stubs</td><td>13</td><td><strong>0</strong></td></tr>
+<tr><td>stdio stubs (fwrite/fputs/stderr)</td><td>6</td><td><strong>0</strong></td></tr>
+<tr><td>Environment stubs (secure_getenv, etc.)</td><td>5</td><td><strong>0</strong></td></tr>
+<tr><td>Stack protector / fortify stubs</td><td>2–9 (distro build)</td><td><strong>0</strong></td></tr>
+<tr><td><code>.init_array</code> heap-timing issue</td><td>yes</td><td><strong>no</strong></td></tr>
+<tr><td>TLS register issue</td><td>yes</td><td><strong>no</strong></td></tr>
+</tbody>
+</table>
+
+<h2>A Bug We Found Along the Way</h2>
+
+<p><code>--disable-hosted-libstdcxx</code> does not imply <code>--disable-tls</code>. This is a gap in GCC's freestanding configuration.</p>
+
+<p>The <code>_GLIBCXX_HAVE_TLS</code> flag is set by <code>GCC_CHECK_TLS</code>, which tests whether the <em>compiler</em> supports the <code>__thread</code> keyword. On a native aarch64 build, it does — so <code>_GLIBCXX_HAVE_TLS=1</code> regardless of whether <code>_GLIBCXX_HOSTED</code> is 0 or 1.</p>
+
+<p>In <code>eh_globals.cc</code>, <code>_GLIBCXX_HAVE_TLS</code> is checked <em>before</em> <code>__GTHREADS</code> or <code>_GLIBCXX_HOSTED</code>:</p>
+
+<pre><code>#if _GLIBCXX_HAVE_TLS           // checked first
+  static __thread ...;           // Path A: reads TPIDR_EL0
+#else
+  #if __GTHREADS                 // checked second
+    ...                          // Path B: pthread_key
+  #else
+    __constinit ...;             // Path C: single global ← what we want
+  #endif
+#endif</code></pre>
+
+<p>So even in a freestanding build, <code>eh_globals.o</code> reads <code>TPIDR_EL0</code> — a thread pointer register that a kernel hasn't set up. The result is a data abort on the first <code>__cxa_end_catch</code>, reading from a garbage address.</p>
+
+<p>Adding <code>--disable-tls</code> to the configure fixes it. Whether <code>--disable-hosted-libstdcxx</code> should imply <code>--disable-tls</code> is a question for the GCC maintainers. The freestanding path in <code>eh_globals.cc</code> (Path C) is well-written and works perfectly — it's just never reached because <code>_GLIBCXX_HAVE_TLS</code> takes priority.</p>
+
+<p>We found this by installing a synchronous exception vector table (<code>VBAR_EL1</code>) in our boot code. The vector table printed the faulting address (<code>ELR_EL1</code>), the exception syndrome (<code>ESR_EL1 = 0x96000004</code> — data abort, translation fault level 0, read), and the target address (<code>FAR_EL1 = 0x00800080008000d0</code> — garbage from uninitialized TPIDR_EL0). Without the vector table, the symptom was a silent hang after the first catch block, indistinguishable from any other fault.</p>
+
+<h2>What C++26 Gives a Freestanding Kernel</h2>
+
+<p>With the GCC freestanding build, I also tested which C++23/26 standard library headers actually compile and work. The method was simple: <code>#include</code> each one individually with <code>-std=c++2c -ffreestanding -nostdlib -fsyntax-only</code>, then write a combined usage test for the ones that passed.</p>
+
+<p><strong>21 of 30 tested headers compile and are usable:</strong></p>
+
+<table>
+<thead><tr><th>Category</th><th>Headers</th></tr></thead>
+<tbody>
+<tr><td>Synchronization</td><td><code>&lt;atomic&gt;</code> — lock-free CAS, fetch_add, memory ordering, atomic_flag</td></tr>
+<tr><td>Error handling</td><td><code>&lt;expected&gt;</code> — <code>std::expected&lt;T,E&gt;</code> with monadic chaining</td></tr>
+<tr><td>Type-safe containers</td><td><code>&lt;variant&gt;</code>, <code>&lt;tuple&gt;</code>, <code>&lt;array&gt;</code>, <code>&lt;span&gt;</code></td></tr>
+<tr><td>Bit manipulation</td><td><code>&lt;bit&gt;</code> — popcount, countl_zero, bit_ceil</td></tr>
+<tr><td>Type system</td><td><code>&lt;concepts&gt;</code>, <code>&lt;type_traits&gt;</code>, <code>&lt;limits&gt;</code>, <code>&lt;compare&gt;</code></td></tr>
+<tr><td>Iteration</td><td><code>&lt;iterator&gt;</code>, <code>&lt;numeric&gt;</code></td></tr>
+<tr><td>Core language support</td><td><code>&lt;exception&gt;</code>, <code>&lt;typeinfo&gt;</code>, <code>&lt;new&gt;</code>, <code>&lt;initializer_list&gt;</code>, <code>&lt;cstdint&gt;</code>, etc.</td></tr>
+</tbody>
+</table>
+
+<p><strong>9 headers fail due to GCC implementation gaps:</strong></p>
+
+<p><code>&lt;optional&gt;</code>, <code>&lt;string_view&gt;</code>, <code>&lt;algorithm&gt;</code>, <code>&lt;ranges&gt;</code> fail because GCC's C++26 <code>std::format</code> integration is pulled in unconditionally (the missing file is <code>bits/formatfwd.h</code>). <code>&lt;functional&gt;</code>, <code>&lt;memory&gt;</code>, <code>&lt;charconv&gt;</code>, <code>&lt;cstring&gt;</code> fail for similar hosted-dependency reasons. All are fixable GCC bugs — the C++ standard marks these headers as (at least partially) freestanding.</p>
+
+<p><strong>The most important finding: <code>&lt;atomic&gt;</code> works end-to-end.</strong> On aarch64, <code>std::atomic&lt;int&gt;::fetch_add</code>, <code>compare_exchange_strong</code>, and all memory orderings compile to the <code>__aarch64_ldadd*</code> / <code>__aarch64_cas*</code> dispatch helpers in libgcc, which we already link. No <code>libatomic</code> needed. This means a kernel can use <code>std::atomic</code> for all synchronization — spinlocks via <code>atomic_flag</code>, lock-free queues via <code>atomic&lt;T*&gt;</code>, compare-and-swap for wait-free algorithms — without any additional stubs or libraries.</p>
+
+<p><strong><code>&lt;expected&gt;</code> coexists with exceptions.</strong> <code>std::expected&lt;T,E&gt;</code> is available for hot paths (interrupt handlers, scheduler inner loops) where exceptions are too expensive, while <code>throw</code>/<code>catch</code> remains available for cold paths (initialization, error recovery). This is not an either-or choice — both mechanisms work in the same binary, in the same kernel.</p>
+
+<h2>What This Means in Practice</h2>
+
+<p>A kernel developer targeting aarch64 with GCC 16 has access to:</p>
+
+<p><strong>Runtime features (7 walls for hosted libsupc++, 4 for freestanding):</strong></p>
+<ul>
+<li>C++ exceptions with full DWARF stack unwinding</li>
+<li>RTTI (<code>typeid</code>, <code>dynamic_cast</code>)</li>
+</ul>
+
+<p><strong>Standard library (no additional stubs beyond the 11):</strong></p>
+<ul>
+<li><code>std::atomic&lt;T&gt;</code> — all integer widths, all memory orderings</li>
+<li><code>std::expected&lt;T,E&gt;</code> — monadic error handling with <code>transform</code> / <code>and_then</code></li>
+<li><code>std::variant&lt;Ts...&gt;</code> — type-safe discriminated unions with <code>std::visit</code></li>
+<li><code>std::tuple</code> — structured returns with structured bindings</li>
+<li><code>std::array&lt;T,N&gt;</code>, <code>std::span&lt;T&gt;</code> — bounds-aware containers and views</li>
+<li><code>std::popcount</code>, <code>std::countl_zero</code>, etc. — hardware bit operations with standard names</li>
+<li><code>std::integral</code>, <code>std::same_as</code>, etc. — template constraints</li>
+</ul>
+
+<p><strong>Kernel obligations (the irreducible contract):</strong></p>
+<ul>
+<li>Provide 9 basic C functions: <code>malloc</code>, <code>free</code>, <code>calloc</code>, <code>abort</code>, <code>memcpy</code>, <code>memmove</code>, <code>memset</code>, <code>strcmp</code>, <code>strlen</code></li>
+<li>Provide 2 platform stubs: <code>__getauxval</code> (return 0), <code>_dl_find_object</code> (return -1)</li>
+<li>Enable FP/SIMD (<code>CPACR_EL1.FPEN = 0b11</code>)</li>
+<li>Enable MMU with Normal memory for kernel RAM</li>
+<li>Add <code>QUAD(0)</code> sentinel at end of <code>.eh_frame</code> in linker script</li>
+<li>Call <code>__register_frame(&amp;__eh_frame_start)</code> once before the first throw</li>
+<li>Build GCC with the six-flag freestanding recipe</li>
+</ul>
+
+<p>That is the complete contract. The gap between "hosted C++ program" and "freestanding kernel with modern C++" is this list and nothing else.</p>
+
+<hr>
+
+<h2>Methodology</h2>
+
+<p>GCC 16 trunk (commit date 2026-04-12) built from source with the configure options listed above. Kernel: the same <code>cppkernel</code> toy kernel from the previous article — aarch64, QEMU virt, Cortex-A72. Tests: M0 through M4 (boot, global constructors, heap, exceptions, RTTI) all pass.</p>
+
+<p>The C++26 header probe was done by compiling each <code>#include</code> individually with <code>-std=c++2c -ffreestanding -nostdlib -fsyntax-only</code> inside the same Docker container. Feature usage was verified with a combined test file that exercises <code>atomic</code> CAS, <code>expected</code> chaining, <code>variant</code> visit, <code>span</code> subspan, <code>bit</code> popcount, <code>concepts</code> constraints, and structured bindings — all compiled without errors.</p>
+
+<p>The 11-symbol surface was found by linking the kernel with an empty runtime file (zero stubs) and collecting every <code>undefined reference</code> the linker reported. No symbols were added speculatively.</p>
+
+<p>The TLS bug was diagnosed using a synchronous exception vector table (<code>VBAR_EL1</code>) that reports <code>ELR_EL1</code> (faulting PC), <code>ESR_EL1</code> (exception syndrome), and <code>FAR_EL1</code> (fault address) on any data abort. Installing this vector table early in the boot sequence is the single most impactful debugging technique for bare-metal aarch64 work.</p>
+
+<div class="footer">
+<p>Source article: <a href="article-freestanding-landscape-aarch64.md">Markdown</a> &middot; Code: <a href="aarch64-freestanding/">aarch64-freestanding/</a> &middot; Contact: <a href="mailto:toneverdo@gmail.com">toneverdo@gmail.com</a></p>
+</div>
+
+</div>
+</body>
+</html>

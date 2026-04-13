@@ -222,7 +222,7 @@ extern "C" void kernel_main() {
     uart::puts("\n");
     uart::puts("========================================\n");
     uart::puts("  cppkernel — bare metal C++ kernel\n");
-    uart::puts("  Toolchain: GCC 14+ / C++17\n");
+    uart::puts("  Toolchain: GCC trunk / freestanding libsupc++\n");
     uart::puts("  Target:   aarch64 / QEMU virt\n");
     uart::puts("========================================\n\n");
 
